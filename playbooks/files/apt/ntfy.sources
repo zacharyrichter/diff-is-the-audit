@@ -1,0 +1,7 @@
+# Managed by Ansible (base-standards.yml)
+Types: deb
+URIs: https://archive.ntfy.sh/apt
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/ntfy.gpg

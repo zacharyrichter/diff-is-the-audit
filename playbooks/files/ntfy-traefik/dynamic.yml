@@ -1,0 +1,60 @@
+# Managed by Ansible (traefik-standards.yml) - edit in the playbooks repo, not on the host.
+http:
+  routers:
+    ntfy:
+      entryPoints:
+        - https
+      rule: 'Host(`ntfy.example.net`)'
+      service: ntfy
+      middlewares:
+        - securityHeaders
+        - compress
+      tls: {}
+
+  ## SERVICES ##
+  services:
+    ntfy:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:8080
+        passHostHeader: true
+
+  ## MIDDLEWARES ##
+  middlewares:
+    compress:
+      compress:
+        excludedContentTypes:
+          - "image/jpeg"
+          - "image/png"
+          - "image/gif"
+          - "image/webp"
+          - "image/avif"
+          - "video/mp4"
+          - "video/webm"
+          - "application/zip"
+    securityHeaders:
+      headers:
+        customResponseHeaders:
+          X-Robots-Tag: "none,noarchive,nosnippet,notranslate,noimageindex"
+          server: ""
+          X-Forwarded-Proto: "https"
+        sslProxyHeaders:
+          X-Forwarded-Proto: https
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+        customFrameOptionsValue: "SAMEORIGIN"
+        referrerPolicy: "strict-origin-when-cross-origin"
+        contentTypeNosniff: true
+        forceSTSHeader: true
+        stsIncludeSubdomains: true
+        stsSeconds: 315360000
+        stsPreload: true
+
+# Only use secure ciphers - https://ssl-config.mozilla.org/
+tls:
+  options:
+    default:
+      minVersion: VersionTLS13
+      sniStrict: true

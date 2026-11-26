@@ -1,0 +1,29 @@
+[OPTIONS]
+
+enable: 1
+
+[ALIASES]
+
+bastion 10.0.99.5
+mgmt-services 10.0.99.6
+opnsense 10.0.99.1
+pbs 10.0.80.2
+pve1 10.0.99.2
+pve2 10.0.99.3
+pve3 10.0.99.4
+pve4 10.0.99.7
+admin_pc 10.0.99.99
+
+[RULES]
+
+GROUP mgmt-access
+
+[group mgmt-access]
+
+IN ACCEPT -source dc/mgmt-services -dest dc/{{ inventory_hostname }} -p tcp -dport 22 -log nolog # SSH mgmt-services
+IN ACCEPT -source dc/bastion -dest dc/{{ inventory_hostname }} -p tcp -dport 22 -log nolog # SSH bastion
+IN ACCEPT -source dc/bastion -dest dc/{{ inventory_hostname }} -p icmp -log nolog -icmp-type any # ICMP bastion
+IN ACCEPT -source dc/admin_pc -dest dc/{{ inventory_hostname }} -p icmp -log nolog # ICMP admin_pc
+IN ACCEPT -source dc/admin_pc -dest dc/{{ inventory_hostname }} -p tcp -dport 8006 -log nolog # Web Dashboard admin_pc
+IN ACCEPT -source dc/admin_pc -dest dc/{{ inventory_hostname }} -p tcp -dport 22 -log nolog # SSH admin_pc
+IN ACCEPT -source dc/opnsense -dest dc/{{ inventory_hostname }} -p icmp -log nolog # ICMP OPNsense

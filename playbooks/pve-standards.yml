@@ -1,0 +1,226 @@
+---
+# Proxmox VE / PBS standard (proxmox, backup; see docs/proxmox-standards.md). Repos and the rest of the
+# base standard are in base-standards.yml. With --check --diff it is the audit.
+# Backups run unattended and are rarely looked at, so the checks also prove the backup path:
+# each node's pbs-main storage (by hostname, no pinned fingerprint, reachable now) and every
+# backup job writing to it; on pbs, the datastore mount and its prune, verify and GC jobs.
+# Run as admin. The --check --diff audit can cover every node at once; apply one node at a time (-l <host>):
+#   ansible-playbook playbooks/pve-standards.yml -e ansible_user=admin -e 'ansible_host={{ inventory_hostname }}-admin' -K --check --diff [-l <host>]
+#
+# Files under /etc/pve live on pmxcfs, which doesn't take Ansible's atomic rename. They are
+# rendered to a staging file in /root (written in --check too, so the diff is against the live
+# file), compared with diff (shown as a change), and copied over with cp only when they differ.
+# The firewall can't lock MGMT out: Proxmox's built-in management ipset (the node's own network,
+# 10.0.99.0/24) always allows 22 and 8006, whatever cluster.fw says.
+# Tags: firewall, rootkeys, checks
+
+- name: Proxmox standard
+  hosts: proxmox:backup
+  become: true
+  gather_facts: false
+
+  vars:
+    is_pve: "{{ 'proxmox' in group_names }}"
+    # Backup storage. The nodes reach pbs by name and check its Let's Encrypt certificate like a
+    # browser does: a pinned fingerprint (or the IP, which the certificate doesn't cover) breaks
+    # every backup at the next renewal.
+    pbs_storage: pbs-main
+    pbs_server: pbs.example.net
+    pbs_username: "backup-sync@pbs!pve-token"
+    pbs_datastore_path: /mnt/datastore/pbs
+
+  tasks:
+    # ------------------------------------------------------------------ firewall (PVE)
+    - name: Render cluster.fw to staging
+      template:
+        src: pve-cluster.fw.j2
+        dest: /root/.fleet-cluster.fw
+        owner: root
+        group: root
+        mode: '0600'
+      check_mode: false
+      when: is_pve
+      tags: firewall
+
+    - name: Compare with the live cluster.fw
+      command: diff -u /etc/pve/firewall/cluster.fw /root/.fleet-cluster.fw
+      register: fw_diff
+      changed_when: fw_diff.rc == 1
+      failed_when: fw_diff.rc > 1
+      check_mode: false
+      when: is_pve
+      tags: firewall
+
+    - name: Show the firewall change
+      debug:
+        msg: "{{ fw_diff.stdout_lines }}"
+      when: is_pve and fw_diff.rc == 1
+      tags: firewall
+
+    - name: Install cluster.fw (pve-firewall picks it up within seconds)
+      command: cp /root/.fleet-cluster.fw /etc/pve/firewall/cluster.fw
+      when: is_pve and fw_diff.rc == 1 and not ansible_check_mode
+      tags: firewall
+
+    - name: Firewall compiles and runs
+      command: pve-firewall status
+      register: fw_status
+      changed_when: false
+      failed_when: "'enabled/running' not in fw_status.stdout"
+      check_mode: false
+      when: is_pve
+      tags: firewall
+
+    # ------------------------------------------------------------------ root keys (PVE)
+    # Root login is off fleet-wide; root's authorized_keys keeps only the node's own key
+    # (what Proxmox sets up on a standalone node). Old cluster keys from other nodes go.
+    - name: Read the node's own root key
+      slurp:
+        src: /root/.ssh/id_rsa.pub
+      register: own_key
+      when: is_pve
+      tags: rootkeys
+
+    - name: Staging copy with only the node's own key
+      copy:
+        dest: /root/.fleet-authorized_keys
+        content: "{{ own_key.content | b64decode | trim }}\n"
+        owner: root
+        group: root
+        mode: '0600'
+      check_mode: false
+      when: is_pve
+      tags: rootkeys
+
+    - name: Compare with the live authorized_keys (/root/.ssh/authorized_keys -> /etc/pve/priv)
+      command: diff -u /root/.ssh/authorized_keys /root/.fleet-authorized_keys
+      register: rk_diff
+      changed_when: rk_diff.rc == 1
+      failed_when: rk_diff.rc > 1
+      check_mode: false
+      when: is_pve
+      tags: rootkeys
+
+    - name: Show the key change (key type and comment only)
+      debug:
+        msg: "{{ rk_diff.stdout_lines | select('match', '^[-+]ssh') | map('regex_replace', '^([-+]\\S+) \\S+ (.*)$', '\\1 \\2') | list }}"
+      when: is_pve and rk_diff.rc == 1
+      tags: rootkeys
+
+    - name: Install root's authorized_keys
+      command: cp /root/.fleet-authorized_keys /root/.ssh/authorized_keys
+      when: is_pve and rk_diff.rc == 1 and not ansible_check_mode
+      tags: rootkeys
+
+    # ------------------------------------------------------------------ checks
+    - name: Read backup storage and jobs, NUT mode and notification targets
+      slurp:
+        src: "{{ item }}"
+      loop: "{{ ['/etc/pve/storage.cfg', '/etc/pve/jobs.cfg', '/etc/nut/nut.conf', '/etc/pve/notifications.cfg'] if is_pve
+                else ['/etc/proxmox-backup/datastore.cfg', '/etc/proxmox-backup/prune.cfg', '/etc/proxmox-backup/verification.cfg', '/etc/proxmox-backup/notifications.cfg'] }}"
+      register: pve_files
+      tags: checks
+
+    - name: Backup storage reachable now (network, login, certificate and datastore)
+      command: pvesm status --storage {{ pbs_storage }}
+      register: pbs_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: is_pve
+      tags: checks
+
+    - name: Datastore mounted (pbs)
+      command: findmnt -n -o FSTYPE {{ pbs_datastore_path }}
+      register: pbs_mount
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: not is_pve
+      tags: checks
+
+    - name: Compare with the standard
+      set_fact:
+        pve_problems: >-
+          {%- set out = [] -%}
+          {%- set f = dict(pve_files.results | map(attribute='item') | zip(pve_files.results | map(attribute='content') | map('b64decode'))) -%}
+          {%- if is_pve -%}
+            {%- set st = [] -%}
+            {%- for block in f['/etc/pve/storage.cfg'].split('\n\n') if ((block | trim).split('\n')[0] | trim) == 'pbs: ' ~ pbs_storage -%}
+              {%- set _ = st.append(block) -%}
+            {%- endfor -%}
+            {%- if st | length != 1 -%}
+              {%- set _ = out.append('no ' ~ pbs_storage ~ ' storage in storage.cfg') -%}
+            {%- else -%}
+              {%- if st[0] is not search('(?m)^\s+server\s+' ~ (pbs_server | regex_escape) ~ '\s*$') -%}
+                {%- set _ = out.append(pbs_storage ~ ': server is not ' ~ pbs_server ~ ' (an IP fails the certificate check)') -%}
+              {%- endif -%}
+              {%- if st[0] is search('(?m)^\s+fingerprint\s') -%}
+                {%- set _ = out.append(pbs_storage ~ ': pinned fingerprint (backups break at the next certificate renewal)') -%}
+              {%- endif -%}
+              {%- if st[0] is not search('(?m)^\s+username\s+' ~ (pbs_username | regex_escape) ~ '\s*$') -%}
+                {%- set _ = out.append(pbs_storage ~ ': username is not ' ~ pbs_username) -%}
+              {%- endif -%}
+              {%- if st[0] is search('(?m)^\s+disable\b') -%}
+                {%- set _ = out.append(pbs_storage ~ ': storage disabled') -%}
+              {%- endif -%}
+            {%- endif -%}
+            {%- if pbs_status.rc != 0 or pbs_status.stdout is not search('(?m)^' ~ pbs_storage ~ '\s+pbs\s+active\s') -%}
+              {%- set _ = out.append(pbs_storage ~ ' not active: ' ~ ((pbs_status.stderr | default('')) ~ ' ' ~ (pbs_status.stdout | default(''))) | trim) -%}
+            {%- endif -%}
+            {%- for block in f['/etc/pve/jobs.cfg'].split('\n\n') if block is match('^vzdump: ') -%}
+              {%- set id = block.split('\n')[0].split(': ')[1] | trim -%}
+              {%- if block is not search('(?m)^\s+storage\s+' ~ (pbs_storage | regex_escape) ~ '\s*$') -%}
+                {%- set _ = out.append('backup job ' ~ id ~ ': not writing to ' ~ pbs_storage) -%}
+              {%- endif -%}
+              {%- if block is search('(?m)^\s+enabled\s+0\s*$') -%}
+                {%- set _ = out.append('backup job ' ~ id ~ ': disabled') -%}
+              {%- endif -%}
+              {%- set m = block | regex_search('\n\s*mode\s+(\S+)', '\\1') -%}
+              {%- set mode = m[0] if m else 'snapshot' -%}
+              {%- if mode == 'stop' and id not in pve_backup_stop_jobs -%}
+                {%- set _ = out.append('backup job ' ~ id ~ ': mode stop (only database VMs, listed in pve_backup_stop_jobs)') -%}
+              {%- elif mode != 'stop' and id in pve_backup_stop_jobs -%}
+                {%- set _ = out.append('backup job ' ~ id ~ ': mode ' ~ mode ~ ', expected stop') -%}
+              {%- elif mode not in ['stop', 'snapshot'] -%}
+                {%- set _ = out.append('backup job ' ~ id ~ ': mode ' ~ mode) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if f['/etc/nut/nut.conf'] is not search('(?m)^MODE=netclient$') -%}
+              {%- set _ = out.append('NUT is not MODE=netclient') -%}
+            {%- endif -%}
+            {%- if f['/etc/pve/notifications.cfg'] is not search('(?m)^webhook: ntfy$') -%}
+              {%- set _ = out.append('no ntfy webhook notification target') -%}
+            {%- endif -%}
+          {%- else -%}
+            {%- if (pbs_mount.stdout | default('') | trim) != '9p' -%}
+              {%- set _ = out.append(pbs_datastore_path ~ ' is not mounted (9p share from the NAS)') -%}
+            {%- endif -%}
+            {%- set ds = f['/etc/proxmox-backup/datastore.cfg'] -%}
+            {%- if ds is not search('(?m)^datastore: ' ~ (pbs_storage | regex_escape) ~ '\s*$') -%}
+              {%- set _ = out.append('no ' ~ pbs_storage ~ ' datastore') -%}
+            {%- elif ds is not search('(?m)^\s+path\s+' ~ (pbs_datastore_path | regex_escape) ~ '\s*$') -%}
+              {%- set _ = out.append(pbs_storage ~ ': path is not ' ~ pbs_datastore_path) -%}
+            {%- endif -%}
+            {%- if ds is not search('(?m)^\s+gc-schedule\s') -%}
+              {%- set _ = out.append(pbs_storage ~ ': no garbage collection schedule') -%}
+            {%- endif -%}
+            {%- if f['/etc/proxmox-backup/prune.cfg'] is not search('(?m)^\s+store\s+' ~ (pbs_storage | regex_escape) ~ '\s*$') -%}
+              {%- set _ = out.append(pbs_storage ~ ': no prune job') -%}
+            {%- endif -%}
+            {%- if f['/etc/proxmox-backup/verification.cfg'] is not search('(?m)^\s+store\s+' ~ (pbs_storage | regex_escape) ~ '\s*$') -%}
+              {%- set _ = out.append(pbs_storage ~ ': no verify job') -%}
+            {%- endif -%}
+            {%- if f['/etc/proxmox-backup/notifications.cfg'] is not search('(?m)^webhook: ntfy$') -%}
+              {%- set _ = out.append('no ntfy webhook notification target') -%}
+            {%- endif -%}
+          {%- endif -%}
+          {{ out }}
+      tags: checks
+
+    - name: Node meets the standard
+      assert:
+        that: pve_problems | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ pve_problems }}"
+        success_msg: "{{ inventory_hostname }}: {{ 'backup storage and jobs, NUT and notifications' if is_pve else 'datastore, its jobs and notifications' }} OK"
+      tags: checks

@@ -1,0 +1,3 @@
+// Managed by Ansible (base-standards.yml). The recipient is a placeholder: sendmail is the ntfy shim.
+Unattended-Upgrade::Mail "ntfy";
+Unattended-Upgrade::MailReport "on-change";

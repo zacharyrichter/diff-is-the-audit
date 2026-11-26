@@ -1,0 +1,646 @@
+---
+# CIS baseline for Debian-based hosts (Wazuh SCA findings). Idempotent; safe to rerun on the whole fleet.
+# Run as the admin account, one host at a time at first:
+#   ansible-playbook playbooks/cis-baseline.yml -e ansible_user=admin -e ansible_host=<host>-admin -K --check --diff -l <host>
+# bastion has no -admin alias: apply the sshd drop-in and the ansible-audit sudoers file there by hand.
+# Accepted (not remediated) SCA checks and the reasons are documented in docs/cis-baseline.md.
+- name: CIS baseline for Debian and Proxmox hosts
+  hosts: debian_fleet:proxmox:backup
+  become: true
+  gather_facts: true
+
+  vars:
+    is_lxc: "{{ ansible_virtualization_type | default('') == 'lxc' }}"
+    login_banner: "Authorized access only. Activity on this system is monitored and logged."
+    sshd_allow_users: "admin ansible"
+    audit_immutable: true          # set true for the fleet rollout; then rule changes need a reboot
+    audit_backlog_limit: 8192
+    faillock_deny: 5
+    faillock_unlock_time: 900
+  tasks:
+    # --- cron permissions ---
+    - name: Restrict /etc/crontab
+      file:
+        path: /etc/crontab
+        owner: root
+        group: root
+        mode: '0600'
+      tags: cron
+
+    - name: Restrict cron directories
+      file:
+        path: "/etc/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      loop: [cron.hourly, cron.daily, cron.weekly, cron.monthly, cron.d]
+      tags: cron
+
+    # --- login banners (no OS details) ---
+    - name: Set remote login banner
+      copy:
+        dest: /etc/issue.net
+        content: "{{ login_banner }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+      tags: banners
+
+    - name: Remove /etc/motd (the SCA banner check fails on any motd text; the banner covers the warning)
+      file:
+        path: /etc/motd
+        state: absent
+      tags: banners
+
+    - name: Set local console banner (not on Proxmox/PBS; pvebanner owns /etc/issue there)
+      copy:
+        dest: /etc/issue
+        content: "{{ login_banner }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+      when: "'proxmox' not in group_names and 'backup' not in group_names"
+      tags: banners
+
+    # --- packages ---
+    - name: Remove telnet clients and vim (nano is the editor)
+      apt:
+        name: [telnet, inetutils-telnet, vim-tiny, vim-common]
+        state: absent
+        purge: true
+      tags: packages
+
+    - name: Install AppArmor tools
+      apt:
+        name: [apparmor, apparmor-utils]
+        state: present
+      tags: packages
+
+    # --- rpcbind (no NFS storage anywhere, LVM only) ---
+    - name: Gather installed packages
+      package_facts:
+      tags: rpcbind
+
+    - name: Stop and mask rpcbind
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+        masked: true
+      loop: [rpcbind.socket, rpcbind.service]
+      when: "'rpcbind' in ansible_facts.packages"
+      tags: rpcbind
+
+    # --- Unused network/filesystem kernel modules (open kernel CVEs, no distro fix yet) ---
+    # None are used: no SCTP, NFS/SMB/9p/Ceph mounts, NFS or SMB serving, or NTFS disks.
+    # Modules autoload on demand
+    # (an unprivileged socket() call is enough for sctp). "install ... /bin/false" also
+    # stops an explicit modprobe; "blacklist" only stops alias autoloading.
+    # netfs is blocked too: modprobe loads a blocked module's dependencies before refusing it.
+    # Not in LXCs (shared host kernel). Not on Proxmox/PBS: decide per host before adding.
+    # To use one of these later, remove its two lines first.
+    - name: Block unused network/filesystem kernel modules
+      copy:
+        dest: /etc/modprobe.d/cis-blocked-modules.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by cis-baseline.yml
+          blacklist sctp
+          install sctp /bin/false
+          blacklist nfsd
+          install nfsd /bin/false
+          blacklist ksmbd
+          install ksmbd /bin/false
+          blacklist cifs
+          install cifs /bin/false
+          blacklist 9p
+          install 9p /bin/false
+          blacklist ceph
+          install ceph /bin/false
+          blacklist ntfs
+          install ntfs /bin/false
+          blacklist ntfs3
+          install ntfs3 /bin/false
+          blacklist netfs
+          install netfs /bin/false
+      when: "not is_lxc and 'proxmox' not in group_names and 'backup' not in group_names"
+      tags: kmod
+
+    # --- Kernel and network sysctl hardening ---
+    # Current Debian releases no longer read /etc/sysctl.conf (only /etc/sysctl.d/), so settings
+    # left there are ignored at boot and a host can run on kernel defaults unnoticed.
+    # Deliberately NOT set here:
+    #   - ip_forward: Docker turns it on where it runs; Proxmox bridges guests and doesn't route.
+    #   - rp_filter: the distro defaults stay (all=0, every interface 2 / loose). all=1 would make
+    #     every interface strict, which can drop legitimate traffic on Docker and Proxmox bridges.
+    # LXCs share the host's kernel: they get only the per-network-namespace net.* settings;
+    # their kernel.* and fs.* values come from the Proxmox host they run on.
+    - name: sysctl hardening file
+      copy:
+        dest: /etc/sysctl.d/60-cis-hardening.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by cis-baseline.yml
+          # The '*' lines cover all, default and every interface that already exists.
+          # Several of these are OR'd with the per-interface value (e.g. send_redirects), so
+          # setting only all/default would leave interfaces created before boot-time sysctl
+          # (ens18) unchanged. systemd's udev rule re-applies them to new interfaces.
+          # ICMP redirects: never accept, never send
+          net.ipv4.conf.*.accept_redirects = 0
+          net.ipv6.conf.*.accept_redirects = 0
+          net.ipv4.conf.*.secure_redirects = 0
+          net.ipv4.conf.*.send_redirects = 0
+          # No source routing
+          net.ipv4.conf.*.accept_source_route = 0
+          net.ipv6.conf.*.accept_source_route = 0
+          # Log martian packets
+          net.ipv4.conf.*.log_martians = 1
+          # SYN flood protection; ignore broadcast pings and bogus ICMP errors
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          net.ipv4.icmp_ignore_bogus_error_responses = 1
+          {% if not (is_lxc | bool) %}
+          # Kernel (not in LXCs: these belong to the Proxmox host)
+          kernel.sysrq = 0
+          kernel.kptr_restrict = 2
+          kernel.dmesg_restrict = 1
+          kernel.randomize_va_space = 2
+          fs.protected_symlinks = 1
+          fs.protected_hardlinks = 1
+          {% endif %}
+      register: sysctl_conf
+      tags: sysctl
+
+    # ufw applies its own /etc/ufw/sysctl.conf every time it starts, which is after systemd-sysctl,
+    # and its stock file turns martian logging off (all + default). Its other settings agree with
+    # the file above. Only the internet-facing host runs ufw; this covers any host that gets it later.
+    - name: Check for ufw's sysctl file
+      stat:
+        path: /etc/ufw/sysctl.conf
+      register: ufw_sysctl
+      tags: sysctl
+
+    - name: Keep martian logging on in ufw's sysctl file
+      replace:
+        path: /etc/ufw/sysctl.conf
+        regexp: '^(net/ipv4/conf/(all|default)/log_martians)=0$'
+        replace: '\1=1'
+      register: ufw_martians
+      when: ufw_sysctl.stat.exists
+      tags: sysctl
+
+    # systemd-sysctl, not "sysctl -p": only systemd-sysctl expands the '*' interface globs.
+    - name: Apply sysctl hardening now (also loaded at every boot by systemd-sysctl)
+      command: /usr/lib/systemd/systemd-sysctl /etc/sysctl.d/60-cis-hardening.conf
+      when: sysctl_conf is changed or ufw_martians is changed
+      tags: sysctl
+
+    # --- /dev/shm noexec (VMs and bare metal only) ---
+    - name: Mount /dev/shm with nodev,nosuid,noexec
+      ansible.posix.mount:
+        path: /dev/shm
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,nodev,nosuid,noexec
+        state: mounted
+      when: not is_lxc
+      tags: shm
+
+    # --- sshd hardening as a drop-in (read before sshd_config, so it wins) ---
+    - name: Ensure sshd_config includes the drop-in directory (first line, so drop-ins win)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        line: "Include /etc/ssh/sshd_config.d/*.conf"
+        insertbefore: BOF
+      register: sshd_include
+      tags: sshd
+
+    - name: Install sshd hardening drop-in
+      copy:
+        dest: /etc/ssh/sshd_config.d/00-cis-hardening.conf
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          # Managed by cis-baseline.yml
+          PermitRootLogin no
+          LoginGraceTime 30
+          MaxAuthTries 3
+          MaxStartups 10:30:60
+          ClientAliveInterval 15
+          ClientAliveCountMax 3
+          DisableForwarding yes
+          Banner /etc/issue.net
+          MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+          AllowUsers {{ sshd_allow_users }}
+      register: sshd_dropin
+      tags: sshd
+
+    - name: Validate sshd config
+      command: sshd -t
+      changed_when: false
+      when: sshd_dropin is changed or sshd_include is changed
+      tags: sshd
+
+    - name: Check whether sshd is socket-activated
+      command: systemctl is-active ssh.socket
+      register: ssh_socket
+      changed_when: false
+      failed_when: false
+      when: sshd_dropin is changed or sshd_include is changed
+      tags: sshd
+
+    - name: Apply sshd config (restart when socket-activated; a reload re-execs sshd and it can't rebind the socket's port)
+      systemd:
+        name: ssh
+        state: "{{ 'restarted' if ssh_socket.stdout == 'active' else 'reloaded' }}"
+      when: sshd_dropin is changed or sshd_include is changed
+      tags: sshd
+
+    # --- sudo logfile and timeout (NOPASSWD for ansible is accepted by design) ---
+    - name: sudo defaults (logfile, 15 min timestamp)
+      copy:
+        dest: /etc/sudoers.d/cis_defaults
+        owner: root
+        group: root
+        mode: '0440'
+        content: |
+          # Managed by cis-baseline.yml
+          Defaults logfile="/var/log/sudo.log"
+          Defaults timestamp_timeout=15
+        validate: 'visudo -cf %s'
+      tags: sudo
+
+    # The ansible account only audits: exact commands and arguments, no wildcards.
+    # The commands below are the read-only ones this fleet's audits need; extend with your own. A '*' in a
+    # sudoers rule matches any further arguments, apt options included (-o DPkg::Pre-Invoke::=...
+    # runs a command as root), so no rule here may contain one. Anything that changes a host runs
+    # as the admin account with -K.
+    - name: Scope sudo for the ansible account (read-only audit commands)
+      copy:
+        dest: /etc/sudoers.d/ansible-audit
+        owner: root
+        group: root
+        mode: '0440'
+        content: |
+          # Managed by cis-baseline.yml: read-only audit commands, exact arguments, no wildcards
+          ansible ALL=(root) NOPASSWD: /usr/bin/apt-get autoremove --dry-run, /usr/bin/apt-get check
+          {% if 'proxmox' in group_names or 'backup' in group_names %}
+          ansible ALL=(root) NOPASSWD: /usr/sbin/proxmox-boot-tool kernel list
+          {% endif %}
+        validate: 'visudo -cf %s'
+      tags: sudo
+
+    - name: timestamp_timeout in /etc/sudoers too (the SCA sudo-timeout check reads that file directly)
+      lineinfile:
+        path: /etc/sudoers
+        line: "Defaults timestamp_timeout=15"
+        insertafter: '^Defaults\s+env_reset'
+        validate: 'visudo -cf %s'
+      tags: sudo
+
+    - name: Ensure sudo log and opasswd exist with tight permissions
+      file:
+        path: "{{ item }}"
+        state: touch
+        owner: root
+        group: root
+        mode: '0600'
+        modification_time: preserve
+        access_time: preserve
+      loop: [/var/log/sudo.log, /etc/security/opasswd, /etc/security/opasswd.old]
+      tags: sudo
+
+    # --- restrict su to an empty group ---
+    - name: Create empty sugroup
+      group:
+        name: sugroup
+        state: present
+      tags: su
+
+    - name: Require sugroup membership for su (root still passes via pam_rootok)
+      lineinfile:
+        path: /etc/pam.d/su
+        line: "auth       required   pam_wheel.so use_uid group=sugroup"
+        insertafter: '^auth\s+sufficient\s+pam_rootok\.so'
+      tags: su
+
+    # --- auditd with the CIS rule set (not in LXCs: no kernel audit there) ---
+    - name: Install auditd and plugins (acl provides setfacl/chacl for their rules)
+      apt:
+        name: [auditd, audispd-plugins, acl]
+        state: present
+      when: not is_lxc
+      tags: auditd
+
+    - name: Enable and start auditd
+      systemd:
+        name: auditd
+        enabled: true
+        state: started
+      when: not is_lxc
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: auditd
+
+    - name: Install CIS audit rules
+      copy:
+        dest: /etc/audit/rules.d/50-cis.rules
+        owner: root
+        group: root
+        mode: '0640'
+        content: |
+          ## Managed by cis-baseline.yml
+          # scope
+          -w /etc/sudoers -p wa -k scope
+          -w /etc/sudoers.d -p wa -k scope
+          # user_emulation
+          -a always,exit -F arch=b64 -C euid!=uid -F auid!=unset -S execve -k user_emulation
+          -a always,exit -F arch=b32 -C euid!=uid -F auid!=unset -S execve -k user_emulation
+          # sudo_log_file
+          -w /var/log/sudo.log -p wa -k sudo_log_file
+          # time-change
+          -a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change
+          -a always,exit -F arch=b32 -S adjtimex,settimeofday -k time-change
+          -a always,exit -F arch=b64 -S clock_settime -F a0=0x0 -k time-change
+          -a always,exit -F arch=b32 -S clock_settime -F a0=0x0 -k time-change
+          -w /etc/localtime -p wa -k time-change
+          # system-locale
+          -a always,exit -F arch=b64 -S sethostname,setdomainname -k system-locale
+          -a always,exit -F arch=b32 -S sethostname,setdomainname -k system-locale
+          -w /etc/issue -p wa -k system-locale
+          -w /etc/issue.net -p wa -k system-locale
+          -w /etc/hosts -p wa -k system-locale
+          -w /etc/networks -p wa -k system-locale
+          -w /etc/network/ -p wa -k system-locale
+          -w /etc/netplan/ -p wa -k system-locale
+          # access
+          -a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+          -a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access
+          -a always,exit -F arch=b32 -S creat,open,openat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+          -a always,exit -F arch=b32 -S creat,open,openat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access
+          # identity
+          -w /etc/group -p wa -k identity
+          -w /etc/passwd -p wa -k identity
+          -w /etc/gshadow -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/security/opasswd -p wa -k identity
+          -w /etc/nsswitch.conf -p wa -k identity
+          -w /etc/pam.conf -p wa -k identity
+          -w /etc/pam.d -p wa -k identity
+          # perm_mod
+          -a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+          -a always,exit -F arch=b64 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+          -a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+          -a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+          -a always,exit -F arch=b32 -S lchown,fchown,chown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+          -a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+          # mounts
+          -a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=unset -k mounts
+          -a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=unset -k mounts
+          # session
+          -w /var/run/utmp -p wa -k session
+          -w /var/log/wtmp -p wa -k session
+          -w /var/log/btmp -p wa -k session
+          # logins
+          -w /var/log/lastlog -p wa -k logins
+          -w /var/run/faillock -p wa -k logins
+          -w /var/log/faillog -p wa -k logins
+          # delete
+          -a always,exit -F arch=b64 -S rename,unlink,unlinkat,renameat -F auid>=1000 -F auid!=unset -k delete
+          -a always,exit -F arch=b32 -S rename,unlink,unlinkat,renameat -F auid>=1000 -F auid!=unset -k delete
+          # MAC-policy
+          -w /etc/apparmor/ -p wa -k MAC-policy
+          -w /etc/apparmor.d/ -p wa -k MAC-policy
+          # perm_chng / usermod
+          -a always,exit -F path=/usr/bin/chcon -F perm=x -F auid>=1000 -F auid!=unset -k perm_chng
+          -a always,exit -F path=/usr/bin/setfacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_chng
+          -a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_chng
+          -a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=unset -k usermod
+          # kernel_modules
+          -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F auid>=1000 -F auid!=unset -k kernel_modules
+          -a always,exit -F path=/usr/bin/kmod -F perm=x -F auid>=1000 -F auid!=unset -k kernel_modules
+      register: audit_rules
+      when: not is_lxc
+      tags: auditd
+
+    # --- immutable audit config (rule changes need a reboot once this is live) ---
+    - name: Immutable audit config
+      copy:
+        dest: /etc/audit/rules.d/99-finalize.rules
+        owner: root
+        group: root
+        mode: '0640'
+        content: |
+          ## Managed by cis-baseline.yml - rule changes require a reboot while this is set
+          -e 2
+      register: audit_final
+      when: not is_lxc and audit_immutable | bool
+      tags: auditd
+
+    - name: Check whether audit rules are already locked
+      command: auditctl -s
+      register: audit_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: not is_lxc and (audit_rules is changed or audit_final is changed)
+      tags: auditd
+
+    - name: Load audit rules (only possible while not locked)
+      command: augenrules --load
+      when:
+        - not is_lxc
+        - audit_rules is changed or audit_final is changed
+        - "'enabled 2' not in (audit_status.stdout | default(''))"
+      tags: auditd
+
+    - name: Warn that a reboot is needed to load changed audit rules
+      debug:
+        msg: "Audit rules on {{ inventory_hostname }} are locked (enabled 2); the changed rules load at next reboot."
+      when:
+        - not is_lxc
+        - audit_rules is changed or audit_final is changed
+        - "'enabled 2' in (audit_status.stdout | default(''))"
+      tags: auditd
+
+    # --- audit backlog limit on the kernel command line (needs update-grub + reboot) ---
+    - name: Check for systemd-boot kernel cmdline (proxmox-boot-tool)
+      stat:
+        path: /etc/kernel/cmdline
+      register: kernel_cmdline
+      when: not is_lxc
+      tags: auditgrub
+
+    - name: Add audit=1 and audit_backlog_limit to GRUB_CMDLINE_LINUX
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX="((?:(?!audit_backlog_limit)[^"])*)"$'
+        line: 'GRUB_CMDLINE_LINUX="\1 apparmor=1 security=apparmor audit=1 audit_backlog_limit={{ audit_backlog_limit }}"'
+        backrefs: true
+      register: grub_cmdline
+      when: not is_lxc and not kernel_cmdline.stat.exists
+      tags: auditgrub
+
+    - name: Regenerate grub config
+      command: update-grub
+      when: grub_cmdline is changed
+      tags: auditgrub
+
+    - name: Warn on hosts booted via proxmox-boot-tool
+      debug:
+        msg: "{{ inventory_hostname }} uses /etc/kernel/cmdline; add audit=1 audit_backlog_limit={{ audit_backlog_limit }} there and run proxmox-boot-tool refresh by hand."
+      when: not is_lxc and kernel_cmdline.stat.exists
+      tags: auditgrub
+
+    # --- PAM (faillock, pwquality, pwhistory, no nullok) via pam-auth-update profiles ---
+    - name: Install pwquality (ships its own pam-auth-update profile)
+      apt:
+        name: libpam-pwquality
+        state: present
+      register: pam_pkg
+      tags: pam
+
+    - name: faillock settings (self-clearing 15 min lockout)
+      copy:
+        dest: /etc/security/faillock.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by cis-baseline.yml
+          deny = {{ faillock_deny }}
+          unlock_time = {{ faillock_unlock_time }}
+          even_deny_root
+          root_unlock_time = 60
+          audit
+      tags: pam
+
+    - name: Ensure pwquality.conf.d exists
+      file:
+        path: /etc/security/pwquality.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: pam
+
+    - name: pwquality settings (apply on next password change only)
+      copy:
+        dest: /etc/security/pwquality.conf.d/50-cis.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by cis-baseline.yml
+          minlen = 14
+          difok = 2
+          maxrepeat = 3
+          maxsequence = 3
+          dictcheck = 1
+          enforcing = 1
+          enforce_for_root
+      tags: pam
+
+    - name: pam-auth-update profile - faillock (counts failures)
+      copy:
+        dest: /usr/share/pam-configs/faillock
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          Name: Enable pam_faillock to deny access
+          Default: yes
+          Priority: 0
+          Auth-Type: Primary
+          Auth:
+          	[default=die]	pam_faillock.so authfail
+      register: pam_p1
+      tags: pam
+
+    - name: pam-auth-update profile - faillock_notify (checks lock, resets on success)
+      copy:
+        dest: /usr/share/pam-configs/faillock_notify
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          Name: Notify of failed login attempts and reset count upon success
+          Default: yes
+          Priority: 1024
+          Auth-Type: Primary
+          Auth:
+          	requisite	pam_faillock.so preauth
+          Account-Type: Primary
+          Account:
+          	required	pam_faillock.so
+      register: pam_p2
+      tags: pam
+
+    - name: pam-auth-update profile - pwhistory
+      copy:
+        dest: /usr/share/pam-configs/pwhistory
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          Name: pwhistory password history checking
+          Default: yes
+          Priority: 1024
+          Password-Type: Primary
+          Password:
+          	requisite	pam_pwhistory.so remember=24 enforce_for_root try_first_pass use_authtok
+      register: pam_p3
+      tags: pam
+
+    - name: Remove nullok from the unix profile (a libpam-runtime update can restore it; rerun this playbook)
+      replace:
+        path: /usr/share/pam-configs/unix
+        regexp: '\s+nullok\b'
+        replace: ''
+      register: pam_p4
+      tags: pam
+
+    - name: Regenerate common-* PAM files
+      command: pam-auth-update --enable faillock faillock_notify pwquality pwhistory
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: pam_pkg is changed or pam_p1 is changed or pam_p2 is changed or pam_p3 is changed or pam_p4 is changed
+      tags: pam
+
+    # --- chrony runs as _chrony (check wants it in chrony.conf and conf.d) ---
+    - name: Check for chrony
+      stat:
+        path: /etc/chrony/chrony.conf
+      register: chrony_cfg
+      tags: chrony
+
+    - name: user _chrony in chrony.conf
+      lineinfile:
+        path: /etc/chrony/chrony.conf
+        line: "user _chrony"
+      register: chrony_u1
+      when: chrony_cfg.stat.exists
+      tags: chrony
+
+    - name: user _chrony in conf.d
+      copy:
+        dest: /etc/chrony/conf.d/cis.conf
+        content: "user _chrony\n"
+        owner: root
+        group: root
+        mode: '0644'
+      register: chrony_u2
+      when: chrony_cfg.stat.exists
+      tags: chrony
+
+    - name: Restart chrony
+      systemd:
+        name: chrony
+        state: restarted
+      when: chrony_cfg.stat.exists and (chrony_u1 is changed or chrony_u2 is changed)
+      tags: chrony

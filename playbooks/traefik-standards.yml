@@ -1,0 +1,161 @@
+---
+# Traefik standard (see docs/traefik-standards.md). With --check --diff it is the audit.
+# Run as admin, check first:
+#   ansible-playbook playbooks/traefik-standards.yml -e ansible_user=admin -e 'ansible_host={{ inventory_hostname }}-admin' -K --check --diff [-l <host>]
+#
+# traefik_docker (apps, dmz, mgmt-services): the config lives in each host's stacks repo;
+#   this play only checks it and installs the access-log rotation.
+# traefik_native (ntfy): Traefik runs outside the container tooling, so this play owns its config,
+#   the update script and the binary's ownership.
+
+- name: Traefik in Docker
+  hosts: traefik_docker
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Access log rotation (Traefik never rotates its access log; USR1 makes it reopen the file)
+      copy:
+        dest: /etc/logrotate.d/traefik-access
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Managed by Ansible (traefik-standards.yml)
+          # Traefik's access log; Traefik reopens it on USR1. traefik.log is rotated by Traefik itself
+          # (log.maxSize/maxBackups/maxAge) and is not touched here.
+          # USR1 goes to the container's host PID with plain kill, never `docker kill`: any docker kill
+          # marks the container as manually stopped, and unless-stopped then leaves Traefik down after
+          # the next daemon stop (reboot, stop-mode backup, Docker upgrade).
+          {{ traefik_access_log }} {
+              daily
+              maxsize 100M
+              rotate 14
+              dateext
+              compress
+              delaycompress
+              missingok
+              notifempty
+              postrotate
+                  pid=$(/usr/bin/docker inspect -f '{{ "{{" }}.State.Pid{{ "}}" }}' traefik 2>/dev/null) && [ "${pid:-0}" -gt 0 ] && kill -USR1 "$pid" || true
+              endscript
+          }
+      tags: logrotate
+
+    - name: One rotation rule per log (older name used on dmz)
+      file:
+        path: /etc/logrotate.d/traefik
+        state: absent
+      tags: logrotate
+
+    - name: Read the static and dynamic config
+      slurp:
+        src: "{{ traefik_config_dir }}/{{ item }}"
+      loop: [traefik.yml, fileConfig.yml]
+      register: tf_files
+      tags: config
+
+    - name: Read the Traefik container's labels
+      command: docker inspect traefik --format '{{ "{{" }}json .Config.Labels{{ "}}" }}'
+      register: tf_labels
+      changed_when: false
+      check_mode: false
+      tags: config
+
+    - name: Compare with the standard
+      set_fact:
+        tf_problems: >-
+          {%- set out = [] -%}
+          {%- set raw = tf_files.results[0].content | b64decode -%}
+          {%- set st = raw | from_yaml -%}
+          {%- set dyn = tf_files.results[1].content | b64decode | from_yaml | default({}, true) -%}
+          {%- set labels = tf_labels.stdout | from_json | default({}, true) -%}
+          {%- if (st.log | default({})).level | default('ERROR') != 'INFO' -%}{%- set _ = out.append('log.level is not INFO') -%}{%- endif -%}
+          {%- for k in ['maxSize', 'maxBackups', 'maxAge'] -%}
+            {%- if k not in (st.log | default({})) -%}{%- set _ = out.append('log.' ~ k ~ ' not set (traefik.log rotation)') -%}{%- endif -%}
+          {%- endfor -%}
+          {%- for name, ep in (st.entryPoints | default({})).items() -%}
+            {%- if ((ep | default({}, true)).http | default({}, true)).aliasHeadersStrategy | default('keep') not in ['delete', 'reject'] -%}
+              {%- set _ = out.append('entryPoint ' ~ name ~ ': aliasHeadersStrategy not delete/reject') -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for key in ['disablePropagationCheck', 'delayBeforeCheck'] -%}
+            {%- if raw is search('(?m)^\\s*' ~ key ~ ':') -%}{%- set _ = out.append('deprecated key ' ~ key) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if (st.serversTransport | default({})).insecureSkipVerify | default(false) -%}
+            {%- set _ = out.append('global serversTransport.insecureSkipVerify (use a named serversTransport per backend)') -%}
+          {%- endif -%}
+          {%- if (st.api | default({})).dashboard | default(false) and not labels['traefik.http.routers.api.middlewares'] | default('') -%}
+            {%- set _ = out.append('dashboard enabled without a middleware on the api router') -%}
+          {%- endif -%}
+          {%- for name, mw in ((dyn.http | default({}, true)).middlewares | default({}, true)).items() -%}
+            {%- if 'forwardAuth' in mw and 'maxResponseBodySize' not in mw.forwardAuth -%}
+              {%- set _ = out.append('middleware ' ~ name ~ ': forwardAuth without maxResponseBodySize') -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if (st.accessLog | default({})).filePath | default('') != traefik_access_log -%}
+            {%- set _ = out.append('accessLog.filePath is not ' ~ traefik_access_log ~ ' (the path logrotate rotates)') -%}
+          {%- endif -%}
+          {{ out }}
+      tags: config
+
+    - name: Traefik config meets the standard
+      assert:
+        that: tf_problems | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ tf_problems }}"
+        success_msg: "{{ inventory_hostname }}: Traefik config OK"
+      tags: config
+
+
+- name: Traefik on ntfy (native install)
+  hosts: traefik_native
+  become: true
+  gather_facts: false
+
+  handlers:
+    - name: Restart traefik
+      systemd:
+        name: traefik
+        state: restarted
+
+  tasks:
+    - name: Static and dynamic config
+      copy:
+        src: "ntfy-traefik/{{ item }}"
+        dest: "/etc/traefik/{{ item }}"
+        owner: root
+        group: traefik
+        mode: '0640'
+      loop: [traefik.yml, dynamic.yml]
+      notify: Restart traefik
+      tags: config
+
+    - name: Update script (v3.x only, checksum-verified, notifies on change or failure)
+      copy:
+        src: ntfy-traefik/traefik-update.sh
+        dest: /usr/local/bin/traefik-update.sh
+        owner: root
+        group: root
+        mode: '0755'
+      tags: update
+
+    - name: Old update copies the script made are not kept
+      file:
+        path: /usr/local/bin/traefik.new
+        state: absent
+      tags: update
+
+    - name: Binary owned by root (only root may replace what the service runs)
+      file:
+        path: /usr/local/bin/traefik
+        owner: root
+        group: root
+        mode: '0755'
+      tags: update
+
+    - name: Daily update timer enabled
+      systemd:
+        name: traefik-update.timer
+        enabled: true
+        state: started
+      tags: update

@@ -1,0 +1,110 @@
+---
+# Docker host standard (docker_hosts; see docs/docker-standards.md).
+# Enforces daemon.json; checks containers, images and networks against the standard.
+# With --check --diff it is the audit (all hosts at once is fine). Apply one host at a time
+# (-l <host>): a daemon.json change restarts Docker, and with it every container on the host.
+#   ansible-playbook playbooks/docker-standards.yml -e ansible_user=admin -e 'ansible_host={{ inventory_hostname }}-admin' -K --check --diff [-l <host>]
+# Tags: daemon, containers
+
+- name: Docker host standard
+  hosts: docker_hosts
+  become: true
+  gather_facts: false
+
+  handlers:
+    - name: Restart docker
+      systemd:
+        name: docker
+        state: restarted
+
+  tasks:
+    # ------------------------------------------------------------------ daemon
+    - name: daemon.json (fleet standard + this host's docker_daemon_extra)
+      copy:
+        dest: /etc/docker/daemon.json
+        content: "{{ docker_daemon_base | combine(docker_daemon_extra, recursive=true) | to_nice_json(indent=2) }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+        validate: dockerd --validate --config-file=%s
+      notify: Restart docker
+      tags: daemon
+
+    - name: Apply daemon.json now (restarts every container on this host)
+      meta: flush_handlers
+      tags: daemon
+
+    # ------------------------------------------------------------------ containers
+    - name: Read every container
+      shell: docker ps -aq | xargs -r docker inspect
+      register: dk_containers
+      changed_when: false
+      check_mode: false
+      tags: containers
+
+    - name: Read every network
+      shell: docker network ls -q | xargs -r docker network inspect
+      register: dk_networks
+      changed_when: false
+      check_mode: false
+      tags: containers
+
+    - name: Compare with the standard
+      set_fact:
+        dk_problems: >-
+          {%- set out = [] -%}
+          {%- set containers = dk_containers.stdout | default('[]', true) | from_json -%}
+          {%- set want_size = docker_daemon_base['log-opts']['max-size'] -%}
+          {%- for c in containers -%}
+            {%- set name = c.Name | regex_replace('^/', '') -%}
+            {%- if c.HostConfig.Privileged -%}{%- set _ = out.append(name ~ ': privileged') -%}{%- endif -%}
+            {%- if (c.Mounts | selectattr('Source', 'in', ['/var/run/docker.sock', '/run/docker.sock']) | list) and name not in docker_socket_allowed -%}
+              {%- set _ = out.append(name ~ ': mounts the Docker socket (not in docker_socket_allowed)') -%}
+            {%- endif -%}
+            {%- for port, binds in (c.HostConfig.PortBindings | default({}, true)).items() -%}
+              {%- for b in binds | default([], true) -%}
+                {%- set p = name ~ ' ' ~ port ~ '->' ~ b.HostPort -%}
+                {%- if p not in docker_published_ports -%}{%- set _ = out.append(p ~ ': published port not in docker_published_ports') -%}{%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {%- set image = c.Config.Image -%}
+            {%- set last = image.split('/')[-1] -%}
+            {%- set tag = last.split(':')[1] if ':' in last else 'latest' -%}
+            {%- set repo_base = last.split(':')[0] -%}
+            {%- set ns = namespace(exc=false) -%}
+            {%- for rx in docker_tag_exceptions -%}{%- if image is match(rx) -%}{%- set ns.exc = true -%}{%- endif -%}{%- endfor -%}
+            {%- if not ns.exc -%}
+              {%- if tag in ['latest', 'nightly'] or 'rolling' in tag -%}
+                {%- set _ = out.append(name ~ ': moving image tag ' ~ image) -%}
+              {%- elif tag is match('^v?[0-9]+(-[a-z0-9]+)?$') and repo_base not in docker_major_pin_allowed -%}
+                {%- set _ = out.append(name ~ ': major-only image tag ' ~ image) -%}
+              {%- endif -%}
+            {%- endif -%}
+            {%- set size = (c.HostConfig.LogConfig.Config | default({}, true))['max-size'] | default('unset') -%}
+            {%- if size != want_size -%}
+              {%- set _ = out.append(name ~ ': log max-size ' ~ size ~ ' (standard ' ~ want_size ~ '; recreate the container after a daemon.json change)') -%}
+            {%- endif -%}
+            {%- if name == 'komodo-periphery' -%}
+              {%- set env = c.Config.Env | default([], true) -%}
+              {%- if 'PERIPHERY_DISABLE_TERMINALS=true' not in env -%}
+                {%- set _ = out.append(name ~ ': PERIPHERY_DISABLE_TERMINALS is not true') -%}
+              {%- endif -%}
+              {%- if (c.HostConfig.PortBindings | default({}, true)) and not (env | select('match', '^PERIPHERY_ALLOWED_IPS=.+') | list) -%}
+                {%- set _ = out.append(name ~ ': port published but PERIPHERY_ALLOWED_IPS is not set') -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for n in dk_networks.stdout | default('[]', true) | from_json -%}
+            {%- if n.Name not in ['bridge', 'host', 'none'] and not (n.Labels | default({}, true))['com.docker.compose.project'] | default('') -%}
+              {%- set _ = out.append('network ' ~ n.Name ~ ': not owned by a compose project') -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      tags: containers
+
+    - name: Containers, images and networks meet the standard
+      assert:
+        that: dk_problems | length == 0
+        fail_msg: "{{ inventory_hostname }}: {{ dk_problems }}"
+        success_msg: "{{ inventory_hostname }}: containers, images and networks OK"
+      tags: containers

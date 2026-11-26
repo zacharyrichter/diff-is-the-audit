@@ -1,0 +1,402 @@
+---
+# Base standard for every Debian, Proxmox and PBS host (see docs/base-standards.md).
+# Enforces the standard; with --check --diff it is the audit (anything "changed" is drift).
+# Run as admin, check first:
+#   ansible-playbook playbooks/base-standards.yml -e ansible_user=admin -e 'ansible_host={{ inventory_hostname }}-admin' -K --check --diff [-l <host>]
+# bastion has no -admin alias: its parts are applied by hand (docs/base-standards.md, "bastion").
+# Tags: apt, updates, time, journald, keys, accounts, leftovers; cups play: cups, remove-cupsadmin.
+
+- name: Base standard
+  hosts: debian_fleet:proxmox:backup:!bastion
+  become: true
+  gather_facts: true
+
+  vars:
+    is_lxc: "{{ ansible_virtualization_type | default('') == 'lxc' }}"
+    is_pve: "{{ 'proxmox' in group_names }}"
+    is_pbs: "{{ 'backup' in group_names }}"
+    is_hypervisor: "{{ is_pve or is_pbs }}"
+    # Every file allowed in /etc/apt/sources.list.d/ on this host; anything else is removed.
+    # apt_sources_extra (group_vars) lists files that another tool manages: kept, never written here.
+    apt_sources_files: >-
+      {{ ['debian.sources'] + apt_sources_extra
+         + (['docker.sources'] if 'docker_hosts' in group_names else [])
+         + (['ntfy.sources'] if inventory_hostname == 'ntfy' else [])
+         + (['pve-no-subscription.sources', 'pve-enterprise.sources', 'ceph.sources'] if is_pve else [])
+         + (['proxmox.sources', 'pbs-enterprise.sources'] if is_pbs else []) }}
+
+  handlers:
+    - name: Update apt cache
+      apt:
+        update_cache: true
+
+    - name: Restart chrony
+      systemd:
+        name: chrony
+        state: restarted
+
+    - name: Restart timesyncd
+      systemd:
+        name: systemd-timesyncd
+        state: restarted
+
+    - name: Restart journald
+      systemd:
+        name: systemd-journald
+        state: restarted
+
+  tasks:
+    # ------------------------------------------------------------------ apt
+    - name: Keyrings the deb822 files point at must exist
+      stat:
+        path: "{{ item }}"
+      loop: >-
+        {{ ['/usr/share/keyrings/debian-archive-keyring.gpg']
+           + (['/etc/apt/keyrings/docker.asc'] if 'docker_hosts' in group_names else [])
+           + (['/etc/apt/keyrings/ntfy.gpg'] if inventory_hostname == 'ntfy' else [])
+           + (['/usr/share/keyrings/proxmox-archive-keyring.gpg'] if is_hypervisor else []) }}
+      register: apt_keyrings
+      tags: apt
+
+    - name: Stop if a keyring is missing
+      assert:
+        that: apt_keyrings.results | rejectattr('stat.exists') | list | length == 0
+        fail_msg: "Missing keyring(s): {{ apt_keyrings.results | rejectattr('stat.exists') | map(attribute='item') | list }}"
+        quiet: true
+      tags: apt
+
+    - name: deb822 source files
+      copy:
+        src: "apt/{{ item }}"
+        dest: "/etc/apt/sources.list.d/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ apt_sources_files | difference(apt_sources_extra) }}"
+      notify: Update apt cache
+      tags: apt
+
+    - name: Empty /etc/apt/sources.list (no one-line sources, no deb-src)
+      copy:
+        src: apt/sources.list
+        dest: /etc/apt/sources.list
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Update apt cache
+      tags: apt
+
+    - name: Find other files in sources.list.d
+      find:
+        paths: /etc/apt/sources.list.d
+        file_type: any
+        hidden: true
+      register: apt_sources_found
+      tags: apt
+
+    - name: Remove sources.list.d files that aren't part of the standard (*.list, *.disabled, ...)
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ apt_sources_found.files | map(attribute='path') | reject('in', apt_sources_files | map('regex_replace', '^', '/etc/apt/sources.list.d/') | list) | list }}"
+      notify: Update apt cache
+      tags: apt
+
+    - name: Find apt leftovers (backups, ucf copies, installer CD-ROM settings)
+      find:
+        paths: [/etc/apt, /etc/apt/apt.conf.d]
+        patterns: ['*.bak', '*.save', '*.orig', '*.ucf-old', '*.ucf-dist', '*.dpkg-old', '*.dpkg-dist', '00trustcdrom', '00CDMountPoint']
+      register: apt_leftovers
+      tags: apt
+
+    - name: Remove apt leftovers
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ apt_leftovers.files | map(attribute='path') | list }}"
+      tags: apt
+
+    - name: Flush handlers (apt update now, so a bad source fails here)
+      meta: flush_handlers
+      tags: apt
+
+    # ------------------------------------------------------------------ updates
+    - name: Gather installed packages
+      package_facts:
+      tags: [updates, time]
+
+    - name: Proxmox/PBS are patched by hand - unattended-upgrades must not be installed
+      assert:
+        that: "'unattended-upgrades' not in ansible_facts.packages"
+        fail_msg: "unattended-upgrades is installed on {{ inventory_hostname }}; PVE/PBS updates stay manual"
+        quiet: true
+      when: is_hypervisor
+      tags: updates
+
+    - name: unattended-upgrades installed (Debian VMs and LXCs)
+      apt:
+        name: unattended-upgrades
+        state: present
+      when: not is_hypervisor
+      tags: updates
+
+    - name: unattended-upgrades schedule and ntfy reporting
+      copy:
+        src: "apt/{{ item }}"
+        dest: "/etc/apt/apt.conf.d/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop: [20auto-upgrades, 51unattended-upgrades-mail]
+      when: not is_hypervisor
+      tags: updates
+
+    - name: unattended-upgrades enabled
+      systemd:
+        name: unattended-upgrades
+        enabled: true
+        state: started
+      when: not is_hypervisor
+      ignore_errors: "{{ ansible_check_mode }}"
+      tags: updates
+
+    - name: Check sendmail
+      stat:
+        path: /usr/sbin/sendmail
+        follow: false
+      register: sendmail_path
+      when: not is_hypervisor
+      tags: updates
+
+    - name: sendmail must not be a real MTA (the ntfy shim is the only mailer)
+      assert:
+        that: not (sendmail_path.stat.exists and sendmail_path.stat.isreg)
+        fail_msg: "/usr/sbin/sendmail is a regular file on {{ inventory_hostname }}; check what installed an MTA"
+        quiet: true
+      when: not is_hypervisor
+      tags: updates
+
+    - name: sendmail points at the ntfy shim
+      file:
+        src: /usr/local/bin/ntfy-sendmail
+        dest: /usr/sbin/sendmail
+        state: link
+      when: not is_hypervisor
+      tags: updates
+
+    # ------------------------------------------------------------------ time
+    - name: Time zone
+      community.general.timezone:
+        name: "{{ fleet_timezone }}"
+      tags: time
+
+    # LXCs take their clock from the Proxmox host; no time sync inside.
+    - name: chrony - comment out pool/server lines in chrony.conf (sources come from sources.d)
+      replace:
+        path: /etc/chrony/chrony.conf
+        regexp: '^((?:pool|server)\s.*)$'
+        replace: '# \1   # replaced by /etc/chrony/sources.d/fleet.sources (Ansible)'
+      notify: Restart chrony
+      when: not is_lxc and 'chrony' in ansible_facts.packages
+      tags: time
+
+    - name: chrony - read sources.d
+      lineinfile:
+        path: /etc/chrony/chrony.conf
+        line: sourcedir /etc/chrony/sources.d
+      notify: Restart chrony
+      when: not is_lxc and 'chrony' in ansible_facts.packages
+      tags: time
+
+    - name: chrony - VLAN gateway as the only time source
+      copy:
+        dest: /etc/chrony/sources.d/fleet.sources
+        content: |
+          # Managed by Ansible (base-standards.yml): this VLAN's OPNsense interface
+          server {{ ntp_server }} iburst
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart chrony
+      when: not is_lxc and 'chrony' in ansible_facts.packages
+      tags: time
+
+    - name: timesyncd - VLAN gateway as the time source
+      lineinfile:
+        path: /etc/systemd/timesyncd.conf
+        regexp: '^#?NTP='
+        line: "NTP={{ ntp_server }}"
+      notify: Restart timesyncd
+      when: not is_lxc and 'chrony' not in ansible_facts.packages
+      tags: time
+
+    # ------------------------------------------------------------------ journald
+    - name: journald drop-in directory
+      file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: journald
+
+    - name: journald settings (drop-in)
+      copy:
+        dest: /etc/systemd/journald.conf.d/60-fleet.conf
+        content: |
+          # Managed by Ansible (base-standards.yml)
+          [Journal]
+          SystemMaxUse={{ journald_system_max_use }}
+          Storage=persistent
+          Compress=yes
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart journald
+      tags: journald
+
+    - name: No size settings left in the main journald.conf (the drop-in owns them)
+      lineinfile:
+        path: /etc/systemd/journald.conf
+        regexp: '^SystemMax(Use|FileSize|Files)='
+        state: absent
+      notify: Restart journald
+      tags: journald
+
+    # ------------------------------------------------------------------ keys
+    - name: admin - only the two hardware keys (certificates are the normal login)
+      authorized_key:
+        user: admin
+        key: "{{ admin_authorized_keys | join('\n') }}"
+        exclusive: true
+        manage_dir: true
+      tags: keys
+
+    - name: Check admin's authorized_keys
+      stat:
+        path: /home/admin/.ssh/authorized_keys
+      register: admin_ak
+      tags: keys
+
+    # Skipped while the file doesn't exist yet (a --check run on a host that has no keys)
+    - name: admin - authorized_keys mode 0600
+      file:
+        path: /home/admin/.ssh/authorized_keys
+        owner: admin
+        group: admin
+        mode: '0600'
+      when: admin_ak.stat.exists
+      tags: keys
+
+    - name: ansible account - certificate only, no plain keys (bastion is the exception, by design)
+      file:
+        path: /home/ansible/.ssh/authorized_keys
+        state: absent
+      tags: keys
+
+    # ------------------------------------------------------------------ accounts
+    - name: admin is in the sudo group (before any stray sudoers file goes)
+      user:
+        name: admin
+        groups: sudo
+        append: true
+        shell: /bin/bash
+      tags: accounts
+
+    - name: No per-user sudoers files (sudo comes from the sudo group)
+      file:
+        path: /etc/sudoers.d/admin
+        state: absent
+      tags: accounts
+
+    - name: List accounts with a login shell
+      command: getent passwd
+      register: passwd
+      changed_when: false
+      check_mode: false
+      tags: accounts
+
+    - name: Sort accounts
+      set_fact:
+        login_users: >-
+          {{ passwd.stdout_lines | map('split', ':')
+             | rejectattr('6', 'search', '(nologin|false|sync)$') | list }}
+      tags: accounts
+
+    - name: System accounts get no login shell (root and ansible keep theirs)
+      user:
+        name: "{{ item[0] }}"
+        shell: /usr/sbin/nologin
+      loop: "{{ login_users | selectattr('2', 'match', '^[0-9]+$') | list }}"
+      loop_control:
+        label: "{{ item[0] }}"
+      when:
+        - item[2] | int < 1000
+        - item[0] not in ['root', 'ansible']
+      tags: accounts
+
+    - name: Only admin as a human account
+      assert:
+        that: item[0] == 'admin'
+        fail_msg: "Unexpected login account on {{ inventory_hostname }}: {{ item[0] }} (uid {{ item[2] }})"
+        quiet: true
+      loop: "{{ login_users | selectattr('2', 'match', '^[0-9]+$') | list }}"
+      loop_control:
+        label: "{{ item[0] }}"
+      when: item[2] | int >= 1000 and item[2] | int < 65534
+      tags: accounts
+
+    # ------------------------------------------------------------------ leftovers
+    - name: Leftover files listed for this host must not be in use by a unit
+      shell: "grep -rlF -- '{{ item }}' /etc/systemd/system /usr/lib/systemd/system 2>/dev/null || true"
+      register: leftover_users
+      changed_when: false
+      check_mode: false
+      loop: "{{ fleet_remove_paths | default([]) }}"
+      tags: leftovers
+
+    - name: Stop if a unit still uses one
+      assert:
+        that: item.stdout | length == 0
+        fail_msg: "{{ item.item }} is still referenced by: {{ item.stdout_lines }}"
+        quiet: true
+      loop: "{{ leftover_users.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: leftovers
+
+    - name: Remove leftover files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ fleet_remove_paths | default([]) }}"
+      tags: leftovers
+
+
+- name: Print server (cups)
+  hosts: cups
+  become: true
+  gather_facts: false
+
+  handlers:
+    - name: Restart cups
+      systemd:
+        name: cups
+        state: restarted
+
+  tasks:
+    - name: admin administers printers (lpadmin is CUPS' SystemGroup)
+      user:
+        name: admin
+        groups: lpadmin
+        append: true
+      tags: cups
+
+    - name: Admin pages only over HTTPS (passwords never cross the network in clear text)
+      lineinfile:
+        path: /etc/cups/cupsd.conf
+        regexp: '^DefaultEncryption\s'
+        line: DefaultEncryption Required
+        insertafter: '^DefaultAuthType\s'
+      notify: Restart cups
+      tags: cups

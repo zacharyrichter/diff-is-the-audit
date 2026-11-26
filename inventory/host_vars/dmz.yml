@@ -1,0 +1,12 @@
+# dmz is internet-facing (cloudflared): extra daemon hardening on top of the fleet standard.
+docker_daemon_extra:
+  no-new-privileges: true
+  # Containers keep running while dockerd restarts (e.g. a docker-ce upgrade), so the tunnel
+  # stays up. Docker only guarantees this across patch releases; on a minor or major upgrade the
+  # containers may still restart, and their unless-stopped policy brings them back.
+  live-restore: true
+  userland-proxy: false
+  icc: false
+docker_socket_allowed: [komodo-periphery]
+docker_published_ports:
+  - "komodo-periphery 8120/tcp->8120"

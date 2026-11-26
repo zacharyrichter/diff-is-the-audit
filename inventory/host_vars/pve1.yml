@@ -1,0 +1,2 @@
+# The VMs here that run databases are stopped for a clean backup; the job's id is listed.
+pve_backup_stop_jobs: [backup-00000000-0001]

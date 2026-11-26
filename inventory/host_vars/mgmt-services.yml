@@ -1,0 +1,9 @@
+# Example of per-host exceptions, each with its reason next to it.
+docker_socket_allowed: [dockersocket, komodo-periphery]
+docker_published_ports:
+  - "traefik 443/tcp->443"
+docker_tag_exceptions:
+  # Browser image follows the daily rolling build on purpose (browser security updates).
+  - '^example/browser:.*-rolling-daily$'
+  # Built locally by its stack; no upstream image or version to pin.
+  - '^local-helper(:latest)?$'

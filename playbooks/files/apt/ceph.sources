@@ -1,0 +1,7 @@
+# Managed by Ansible (base-standards.yml): kept, disabled (no Ceph, no subscription)
+Types: deb
+URIs: https://enterprise.proxmox.com/debian/ceph-squid
+Suites: trixie
+Components: enterprise
+Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+Enabled: false

@@ -1,0 +1,42 @@
+# Managed by Ansible (traefik-standards.yml) - edit in the playbooks repo, not on the host.
+# Traefik on the ntfy LXC: native binary (/usr/local/bin/traefik), systemd unit traefik.service,
+# updated within v3.x by traefik-update.timer. Logs go to the journal (journald rotates them).
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+entryPoints:
+  http:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: https
+          scheme: https
+  https:
+    address: ":443"
+    http:
+      # Drop headers whose names alias another header (X_Forwarded_For vs X-Forwarded-For)
+      aliasHeadersStrategy: delete
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: ntfy.example.net
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+log:
+  level: INFO
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.net
+      storage: /var/lib/traefik/acme.json
+      dnsChallenge:
+        provider: cloudflare
+        propagation:
+          disableChecks: true
+          delayBeforeChecks: 60s

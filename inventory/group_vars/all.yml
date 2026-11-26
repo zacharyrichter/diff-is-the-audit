@@ -1,0 +1,45 @@
+# Fleet standards shared by every host (see docs/the-audit-model.md).
+# Per-host exceptions live in inventory/host_vars/<host>.yml.
+
+fleet_timezone: America/Chicago
+
+# deb822 files in /etc/apt/sources.list.d/ that another tool manages (a monitoring agent's
+# repository, say). base-standards.yml keeps them and never writes them.
+apt_sources_extra: []
+
+# The admin account's break-glass keys (FIDO2, primary and backup hardware key). Certificate
+# login is the normal path; these are the only plain keys the account has on any host.
+admin_authorized_keys:
+  - "sk-ssh-ed25519@openssh.com <primary-key-public-half> primary_hardware_key"
+  - "sk-ssh-ed25519@openssh.com <backup-key-public-half> backup_hardware_key"
+
+journald_system_max_use: 500M
+
+# Docker (docker_hosts). docker_daemon_extra in host_vars is merged on top.
+docker_daemon_base:
+  log-driver: json-file
+  log-opts:
+    max-size: 10m
+    max-file: "3"
+  # Networks without a pinned subnet get a /24 from here: clear of the pinned stack networks
+  # (172.17-172.26), the LANs and WireGuard.
+  default-address-pools:
+    - base: 172.28.0.0/14
+      size: 24
+docker_daemon_extra: {}
+
+# Image tags: a tag must name a version. Major-only tags (postgres:16) are allowed for these
+# repositories only (databases are pinned to a major version on purpose).
+docker_major_pin_allowed: [postgres, mongo, valkey]
+# Per-host exceptions (regex on the image as the container names it, e.g. repository:tag).
+docker_tag_exceptions: []
+# Containers allowed to mount the Docker socket, and allowed published ports ("container 8120/tcp->8120").
+docker_socket_allowed: []
+docker_published_ports: []
+
+# Traefik in Docker (traefik_docker)
+traefik_config_dir: /etc/komodo/stacks/traefik/config
+traefik_access_log: /opt/appdata/traefik/logs/access.log
+
+# Proxmox: vzdump jobs that may use mode=stop (VMs with databases); everything else uses snapshot.
+pve_backup_stop_jobs: []
