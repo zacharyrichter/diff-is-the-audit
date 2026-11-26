@@ -167,7 +167,7 @@ No kernel audit, no bootloader, `/dev/shm` controlled by the container runtime. 
 
 ## Results
 
-The baseline is applied fleet-wide, including the audit lock (`audit_immutable: true`; the bastion by hand). Checks passed of 207, from a fresh Wazuh SCA export per host on 2026-11-26:
+The baseline is applied fleet-wide, including the audit lock (`audit_immutable: true`; the bastion by hand). Checks passed of 207, from a fresh Wazuh SCA export per host:
 
 | Hosts | Passed |
 |---|---|
