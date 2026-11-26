@@ -61,12 +61,15 @@ To fix drift, run the same command without `--check`, one host at a time with `-
 - **A check only finds what someone wrote a rule for.** Passing the audit means the fleet matches the standard, not that the standard is complete.
 - **The management host is a high-value target.** Whatever runs these playbooks can become root on every host in the inventory, so the controller sits on the isolated management network.
 - **One host sits outside the model on purpose.** The bastion has no path from the management host, so its part of the base standard is applied by hand from a block in [`docs/base-standards.md`](docs/base-standards.md#bastion).
-- **Some preconditions live outside this repo:** the SSH certificate authority that issues the normal login, the sendmail-compatible notification shim at `/usr/local/bin/ntfy-sendmail`, and the repository keyrings the playbooks refuse to run without.
+- **Some preconditions live outside this repo:** the SSH certificate authority that issues the normal login ([air-gap-the-keys](https://github.com/zacharyrichter/air-gap-the-keys), with the yearly renewal in [expire-on-purpose](https://github.com/zacharyrichter/expire-on-purpose)), the sendmail-compatible notification shim at `/usr/local/bin/ntfy-sendmail` ([no-mail-server](https://github.com/zacharyrichter/no-mail-server)), and the repository keyrings the playbooks refuse to run without.
 
 ## Related
 
 - [no-open-doors](https://github.com/zacharyrichter/no-open-doors): the internet-facing host's own hardening, which builds on the Docker and Traefik standards here.
 - [trust-no-cache](https://github.com/zacharyrichter/trust-no-cache): rebuilding the lab from a config repo, which applies the CIS baseline from this one.
+- [air-gap-the-keys](https://github.com/zacharyrichter/air-gap-the-keys): the SSH certificate authority, hardware keys and management network this standard assumes.
+- [expire-on-purpose](https://github.com/zacharyrichter/expire-on-purpose): keeping the hosts' SSH certificates valid, with the `host_certs` group these playbooks share.
+- [no-mail-server](https://github.com/zacharyrichter/no-mail-server): the notification shim that the base standard requires in place of a mail server.
 
 Everything here is sanitized: domains are `example.net`, addresses are `10.0.x.x`, and the human account is `admin`.
 
