@@ -18,8 +18,8 @@ What every host is held to, enforced by [`playbooks/base-standards.yml`](../play
 The playbook assumes three things it does not create:
 
 - **Keyrings.** The keyring files the sources point at must already exist. The playbook stops with the missing paths named rather than writing a source that `apt` can't verify.
-- **The notification shim.** `/usr/local/bin/ntfy-sendmail` is a sendmail-compatible script that posts its input to the notification server. `/usr/sbin/sendmail` is linked to it so cron, unattended-upgrades and similar tools report through one channel.
-- **Certificate login.** The SSH certificate authority and the `<host>-admin` aliases exist already. The playbook only enforces what the accounts keep as `authorized_keys`.
+- **The notification shim.** `/usr/local/bin/ntfy-sendmail` is a sendmail-compatible script that posts its input to the notification server. `/usr/sbin/sendmail` is linked to it so cron, unattended-upgrades and similar tools report through one channel. The script and its design are in [no-mail-server](https://github.com/zacharyrichter/no-mail-server).
+- **Certificate login.** The SSH certificate authority and the `<host>-admin` aliases exist already. The playbook only enforces what the accounts keep as `authorized_keys`. The authority is built in [air-gap-the-keys](https://github.com/zacharyrichter/air-gap-the-keys) and its host certificates are renewed by [expire-on-purpose](https://github.com/zacharyrichter/expire-on-purpose).
 
 ## Print server
 
