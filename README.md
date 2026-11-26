@@ -70,6 +70,9 @@ To fix drift, run the same command without `--check`, one host at a time with `-
 - [air-gap-the-keys](https://github.com/zacharyrichter/air-gap-the-keys): the SSH certificate authority, hardware keys and management network this standard assumes.
 - [expire-on-purpose](https://github.com/zacharyrichter/expire-on-purpose): keeping the hosts' SSH certificates valid, with the `host_certs` group these playbooks share.
 - [no-mail-server](https://github.com/zacharyrichter/no-mail-server): the notification shim that the base standard requires in place of a mail server.
+- [backups-nobody-watches](https://github.com/zacharyrichter/backups-nobody-watches): the backup system whose path the Proxmox standard audits.
+- [alerts-worth-a-look](https://github.com/zacharyrichter/alerts-worth-a-look): the monitoring that every audited host reports to, and the alerts it raises.
+- [graceful-power-loss](https://github.com/zacharyrichter/graceful-power-loss): the UPS shutdown chain whose node side the Proxmox standard audits.
 
 Everything here is sanitized: domains are `example.net`, addresses are `10.0.x.x`, and the human account is `admin`.
 

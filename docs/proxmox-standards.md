@@ -34,7 +34,7 @@ Root login is off fleet-wide. Root's `authorized_keys` keeps only the node's own
 
 ## The backup path
 
-Backups run unattended and are rarely looked at, so the audit doesn't trust that they work. It proves it.
+Backups run unattended and are rarely looked at, so the audit doesn't trust that they work. It proves it. The backup system itself, with its schedule, restore procedure and design, is in [backups-nobody-watches](https://github.com/zacharyrichter/backups-nobody-watches).
 
 On each Proxmox node:
 
@@ -44,7 +44,7 @@ On each Proxmox node:
 | The storage is enabled and `active` now | `pvesm status` exercises the network, the login, the certificate and the datastore together |
 | Every backup job writes to that storage and is enabled | A disabled job fails silently |
 | Backup mode is `snapshot`, except for jobs listed in `pve_backup_stop_jobs`, which must be `stop` | VMs with databases are stopped for a clean backup, and the exception list is the only place that is allowed |
-| NUT is `MODE=netclient` | Nodes act as clients of the network UPS monitor |
+| NUT is `MODE=netclient` | Nodes act as clients of the network UPS monitor ([graceful-power-loss](https://github.com/zacharyrichter/graceful-power-loss) has the full chain) |
 | A webhook notification target exists | Failures reach the notification server |
 
 On the backup server:
